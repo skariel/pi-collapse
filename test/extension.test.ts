@@ -4,7 +4,7 @@ import { mkdtemp, rm, stat, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerCollapse } from "../src/index.ts";
+import { description, registerCollapse } from "../src/index.ts";
 import { Storage } from "../src/storage.ts";
 import { CONFIG_TYPE, FORCE_TYPE, OP_TYPE, type Message } from "../src/core.ts";
 
@@ -57,6 +57,22 @@ async function fixture(t: any, messages: Message[], config = { protectRecent: 0 
   await h.emit("session_start");
   return { ...h, sm, storage, dir };
 }
+
+test("guidance prioritizes dependencies and useful cleanup without weakening forced-mode instructions", async t => {
+  const text = description("/test/archives");
+  assert.match(text, /current user constraints, unresolved tasks, unmet acceptance criteria/);
+  assert.match(text, /completion certainty first.*lower dependency risk.*older age.*larger expected savings/);
+  assert.match(text, /Outside forced mode, skip tiny/);
+  assert.match(text, /Prefer outcomes over chronology/);
+  assert.match(text, /At that point, X was unimplemented/);
+  assert.match(text, /Forced mode always requires shrinking/);
+  const f = await fixture(t, [user("hello")]);
+  const start = await f.emit("before_agent_start", { systemPrompt: "Base policy" });
+  assert.ok(start.systemPrompt.startsWith("Base policy"));
+  assert.match(start.systemPrompt, /preserving active dependencies/);
+  assert.match(start.systemPrompt, /then call only collapse/);
+  assert.ok(!start.systemPrompt.includes("FORCED COLLAPSE MODE"));
+});
 
 test("journal replacement survives actual SessionManager save/open, branching and extension reload", async t => {
   const f = await fixture(t, [user("START " + "x".repeat(1500)), user("END " + "y".repeat(1500)), assistant()], undefined, undefined, true);
