@@ -72,10 +72,23 @@ export function validateCollapse(value: unknown): Collapse {
 
 export function apply(rows: Row[], op: Collapse): Row[] {
   const start = rows.findIndex(r => r.key === op.keys[0]);
-  if (start < 0 || op.keys.some((key, i) => rows[start + i]?.key !== key)) {
-    throw new Error(`Cannot replay collapse ${op.id}: history changed or another context extension conflicts. No history was discarded.`);
+  const conflict = () => new Error(`Cannot replay collapse ${op.id}: history changed or another context extension conflicts. No history was discarded.`);
+  if (start < 0) throw conflict();
+  let end = start;
+  const retained: Row[] = [];
+  for (const key of op.keys) {
+    while (rows[end] && rows[end].key !== key) {
+      const message = rows[end].message;
+      // Pi's automatic retry removes empty failed assistant responses from live
+      // context but retains them on disk. Never discard these audit records,
+      // and never tolerate inserted user content, tool calls, or partial output.
+      if (message.role !== "assistant" || message.stopReason !== "error" || message.content.length !== 0) throw conflict();
+      retained.push(rows[end++]);
+    }
+    if (!rows[end]) throw conflict();
+    end++;
   }
-  return [...rows.slice(0, start), ...(op.summary === "" ? [] : [summaryRow(op)]), ...rows.slice(start + op.keys.length)];
+  return [...rows.slice(0, start), ...(op.summary === "" ? [] : [summaryRow(op)]), ...retained, ...rows.slice(end)];
 }
 
 export function project(messages: Message[], operations: Collapse[]): Row[] {

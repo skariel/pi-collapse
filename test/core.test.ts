@@ -8,9 +8,32 @@ import { apply, boundary, eligibleRanges, DEFAULT_CONFIG, expandRange, identify,
 import { Storage } from "../src/storage.ts";
 
 export const user = (content: string, timestamp = 1): Message => ({ role: "user", content, timestamp });
-const assistant = (ids: string[]): Message => ({ role: "assistant", content: ids.map(id => ({ type: "toolCall", name: "bash", id, arguments: { command: id } })), timestamp: 2, api: "openai-responses", provider: "openai", model: "test", stopReason: "toolUse", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
+const assistant = (ids: string[]): Extract<Message, { role: "assistant" }> => ({ role: "assistant", content: ids.map(id => ({ type: "toolCall", name: "bash", id, arguments: { command: id } })), timestamp: 2, api: "openai-responses", provider: "openai", model: "test", stopReason: "toolUse", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } });
 const result = (id: string): Message => ({ role: "toolResult", toolCallId: id, toolName: "bash", content: [{ type: "text", text: `output-${id}` }], isError: false, timestamp: 3 });
 const operation = (rows: ReturnType<typeof identify>, summary = "summary"): Collapse => ({ version: 1, id: randomUUID(), keys: rows.map(r => r.key), summary, timestamp: 10, originalCount: rows.length, supersedes: [] });
+
+test("replay preserves retry-only empty errors omitted from live history, without relaxing other integrity checks", () => {
+  const messages = [user("first"), assistant(["tool"]), result("tool"), user("last")];
+  const live = identify(messages);
+  const error = { ...assistant([]), role: "assistant" as const, stopReason: "error" as const, errorMessage: "overloaded", timestamp: 42 };
+  const persisted = identify([messages[0], error, ...messages.slice(1)]);
+  for (const summary of ["completed", ""]) {
+    const op = operation(live, summary);
+    const replayed = apply(persisted, op);
+    assert.deepEqual(replayed.map(r => r.message), [...(summary ? [summaryRow(op).message] : []), error]);
+    // Subsequent operations made against the live projection also replay.
+    const tail = identify([user("later", 100)]);
+    const next = operation([...apply(live, op), ...tail], "later summary");
+    const again = apply([...replayed, ...tail], next);
+    assert.deepEqual(again.map(r => r.message), summary ? [summaryRow(next).message, error] : [error, summaryRow(next).message]);
+  }
+  for (const inserted of [user("unexpected"), assistant([]), assistant(["unexpected"]),
+    { ...error, content: [{ type: "text" as const, text: "partial output" }] },
+    { ...error, stopReason: "aborted" as const }]) {
+    assert.throws(() => apply(identify([messages[0], inserted, ...messages.slice(1)]), operation(live)), /Cannot replay/);
+  }
+  assert.throws(() => apply(identify([messages[0], error, messages[3]]), operation(live)), /Cannot replay/);
+});
 
 test("literal matching: case, spaces, decoded newlines, JSON and repeated occurrences within one message", () => {
   const rows = identify([user("A  B\nC A  B"), user("a b"), assistant(["xyz"])]);
