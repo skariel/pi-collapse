@@ -37,7 +37,7 @@ Summaries should emphasize decisions and rationale, verified results/evidence pa
 - Otherwise matching is literal, case-sensitive, and whitespace-sensitive. Searches cover compact `JSON.stringify(message)` and every decoded string value inside it. Thus raw multiline text and JSON fragments both work. No fuzzy selection. Missing/ambiguous matches suggest bounded nearby candidates; these are never selected automatically.
 - Any message role can be collapsed, including users, tool messages, and earlier summaries. System instructions/tool schemas are not history messages and cannot be collapsed.
 - Tool-call/result groups expand **outward**, including sibling calls/results and intervening messages. Missing/ambiguous tool pairs are rejected, never split.
-- The latest **10** model-visible messages are normally protected. The snapshot excludes the assistant response currently calling collapse, preventing self-matches against its arguments.
+- Recent-message protection is disabled by default: selection is agent-directed, while dependency-aware guidance tells it to preserve active work. Set `protectRecent` above zero to opt into a fixed normal-mode guard. The snapshot always excludes the assistant response currently calling collapse, preventing self-matches against its arguments.
 - New range summaries must be smaller than the selected range, including the archive marker. Outside forced mode, a correction selecting **exactly one existing summary** may keep the same estimated size or grow by up to 20%, capped at 128 tokens. This allowance is for correcting facts or stale instructions, not repeated expansion. Forced mode always requires shrinking. An empty summary contributes zero replacement tokens.
 - Protection errors report the expanded range and suggest up to three eligible complete ranges, with usable references. Candidates are ranked by serialized content size, not semantic suitability: the agent must still check whether each range is safe to summarize/remove. Incomplete groups and protected ranges are never suggested.
 - Multiple independent ranges can be submitted in one response. Commits serialize; choose ranges that remain disjoint after tool-group expansion, without dependencies on newly created summaries/IDs. A later overlapping call may need to retry against the updated history. Batching useful cleanup can reduce repeated cache disruption, but does not guarantee cache preservation.
@@ -109,7 +109,7 @@ The status bar shows `collapse 42 messages | 3 archives`: original messages repr
 Global configuration: `~/.pi/collapse/config.json`.
 
 ```json
-{"triggerPercent":85,"targetPercent":50,"protectRecent":10}
+{"triggerPercent":85,"targetPercent":50,"protectRecent":0}
 ```
 
 Require `0 < targetPercent < triggerPercent < 100`; `protectRecent` is a nonnegative integer. Session overrides are complete snapshots and follow branches. Global changes do not overwrite them. Other running pi processes load updated globals on reload/session navigation. Commands wait for idle; TUI previews use an editor whose edits are discarded. RPC uses notifications. Previews are capped at 50,000 characters; use filesystem tools for full archives. Commands require TUI/RPC for visible output.

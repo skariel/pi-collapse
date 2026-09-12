@@ -13,7 +13,7 @@ export interface Collapse {
   supersedes: string[];
 }
 export interface Config { triggerPercent: number; targetPercent: number; protectRecent: number }
-export const DEFAULT_CONFIG: Config = { triggerPercent: 85, targetPercent: 50, protectRecent: 10 };
+export const DEFAULT_CONFIG: Config = { triggerPercent: 85, targetPercent: 50, protectRecent: 0 };
 export const OP_TYPE = "collapse.operation.v1";
 export const CONFIG_TYPE = "collapse.config.v1";
 export const FORCE_TYPE = "collapse.force.v1";

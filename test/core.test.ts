@@ -121,6 +121,7 @@ test("protection failures suggest only bounded complete eligible ranges with usa
 });
 
 test("threshold hysteresis and strict configuration validation", () => {
+  assert.equal(DEFAULT_CONFIG.protectRecent, 0);
   assert.equal(nextForced(false, 84.9, DEFAULT_CONFIG), false);
   assert.equal(nextForced(false, 85, DEFAULT_CONFIG), true);
   assert.equal(nextForced(true, 60, DEFAULT_CONFIG), true);
