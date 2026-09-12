@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Type } from "typebox";
 import { buildSessionContext, estimateTokens, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
-  apply, boundary, CONFIG_TYPE, DEFAULT_CONFIG, expandRange, FORCE_TYPE, nextForced, OP_TYPE,
+  apply, boundary, CONFIG_TYPE, DEFAULT_CONFIG, FORCE_TYPE, nextForced, OP_TYPE,
   identify, project, selectRange, summaryRow, validateCollapse, validateConfig,
   type Collapse, type Config, type Message, type Row,
 } from "./core.ts";
@@ -25,7 +25,7 @@ Use summary: "" (exactly empty, not whitespace) to archive and completely remove
 Prefer outcomes over chronology: preserve decisions and their rationale, verified results and evidence paths, and remaining work rather than narrating every intermediate step. Use enough detail for safe continuation; there is no fixed sentence limit. Treat summarization as memory maintenance, not just shortening text. When newer explicit decisions supersede older instructions or plans, remove the obsolete directives from the replacement or clearly label them historical; do not present an old “next step” as current. When later work changed a state, write “At that point, X was unimplemented; later work changed this” rather than leaving “X is unimplemented” as an apparent current fact. Preserve still-applicable user constraints, unresolved work, and useful rationale. If supersession is uncertain, retain the uncertainty rather than silently discarding an instruction. Distinguish implemented, verified, proposed, and blocked work. When using later context to resolve an older range, identify the update as a later decision rather than implying it occurred in the archived range. To clean up an earlier summary, select that summary in a collapse range; a new summary elsewhere does not edit it.
 History rewrites can invalidate cached prefixes. When already collapsing, consider cleaning up other eligible stale summaries and large completed logs/documentation in the same response, rather than repeatedly rewriting history across turns. You may issue multiple independent collapse calls in one response (parallel submission is supported; commits serialize for safety). Choose ranges that remain disjoint after tool-group expansion, and use existing message text as boundaries. Do not make one call depend on a summary or ID created by another call in the same response. Batch useful cleanup, not gratuitous rewrites; each replacement must reduce size except for the bounded single-summary correction allowance below.
 Exactly three arguments: startMatch, endMatch, summary. Each boundary accepts either a literal substring (case-sensitive, whitespace-sensitive, not fuzzy) or an exact returned reference: @collapse:<uuid> targets a current summary, @message:<key> targets a current ordinary message. References resolve message identity, ignoring copies in tool arguments/results. Use the same reference for startMatch and endMatch to edit one summary. Superseded/deleted references no longer resolve; use current suggestions or /collapse list/view. Literal matching otherwise behaves as follows. Search covers compact JSON.stringify(message) and each decoded string value anywhere inside the message, including text, content, tool arguments/results, and JSON. Each match must identify exactly one message; repetitions within that message are okay. Missing or ambiguous matches return bounded closest candidates for you to retry EXACTLY. Boundaries are inclusive. Tool requests and all sibling results must stay together: boundaries expand outward, preferring MORE messages. Incomplete/in-flight tool groups can never be collapsed.
-Normally the latest 10 messages are protected (configurable). At 85% context usage, only collapse is permitted until usage reaches at most 50% (both configurable; see the current system instructions). In forced mode, recent-message protection is waived when necessary to reach the target; tool integrity is never waived. Ordinary answers and other tools are not allowed during forced mode. New range summaries must reduce estimated context size. Outside forced mode, correcting exactly one existing summary may retain its size or grow by at most 20% of its previous estimated size, capped at 128 tokens; use this only for factual/current-state corrections, not gratuitous rewrites. Forced mode always requires shrinking.
+Normally the latest 10 messages are protected (configurable). At 85% context usage, only collapse is permitted until usage reaches at most 50% (both configurable; see the current system instructions). In forced mode, recent-message protection is waived for an otherwise valid selected range so protection cannot deadlock recovery; tool integrity is never waived. Ordinary answers and other tools are not allowed during forced mode. New range summaries must reduce estimated context size. Outside forced mode, correcting exactly one existing summary may retain its size or grow by at most 20% of its previous estimated size, capped at 128 tokens; use this only for factual/current-state corrections, not gratuitous rewrites. Forced mode always requires shrinking.
 Each replacement has a UUID. Originals are saved as one original message per JSONL line at ${directory}/messages-[id].jsonl BEFORE history changes. The filename contains the collapse ID. Outside forced mode use read, bash, grep, or find to retrieve originals there; no special retrieval tool is needed. Collapsing existing summaries flattens their originals together with regular messages in chronological order into ONE new archive. Old summaries and IDs disappear from active history; old archives remain for historical branches/forks. The new summary is authoritative; do not rely on old summaries. Only the history visible before your current response can be selected; your current tool request is not a matching candidate. Outputs and match suggestions are bounded.`;
 }
 
@@ -115,21 +115,12 @@ export function registerCollapse(pi: ExtensionAPI, storage: Storage) {
   function viewRows(ctx: ExtensionContext): Row[] {
     return project(buildSessionContext(ctx.sessionManager.getBranch()).messages, operations);
   }
-  function protection(ctx: ExtensionContext): number {
-    if (!requestForced || config.protectRecent === 0 || !rows) return config.protectRecent;
-    let cutoff = Math.max(0, rows.length - config.protectRecent);
-    // A protected result also protects its (possibly very large) earlier request.
-    if (cutoff < rows.length) {
-      try { cutoff = expandRange(rows, cutoff, rows.length - 1)[0]; }
-      catch { return 0; } // Still never allow selecting an incomplete group.
-    }
-    let eligible = false;
-    for (let i = 0; i < cutoff; i++) {
-      try { if (expandRange(rows, i, i)[1] < cutoff) { eligible = true; break; } } catch { /* unfinished group */ }
-    }
-    const budget = (ctx.model?.contextWindow ?? 0) * config.targetPercent / 100;
-    // If protected messages alone prevent reaching the target, relaxing protection is necessary.
-    return !eligible || tokens(ctx, rows.slice(cutoff)) >= budget ? 0 : config.protectRecent;
+  function protection(): number {
+    // Forced requests are already restricted to collapse, and the in-flight
+    // assistant call is absent from rows. Do not let unrelated small eligible
+    // ranges deadlock a coherent selected range behind the recent tail.
+    // Tool-group integrity remains strict inside selectRange.
+    return requestForced ? 0 : config.protectRecent;
   }
 
   pi.on("session_start", (_event, ctx) => reset(ctx));
@@ -243,7 +234,7 @@ export function registerCollapse(pi: ExtensionAPI, storage: Storage) {
         if (fault) throw new Error(fault);
         if (!rows) throw new Error("No model-visible history snapshot yet");
         if (params.summary !== "" && !params.summary.trim()) throw new Error('Use exactly summary: "" to remove a range; whitespace-only summaries are invalid');
-        const protectedCount = protection(ctx);
+        const protectedCount = protection();
         const [start, end] = selectRange(rows, params.startMatch, params.endMatch, protectedCount);
         const selected = rows.slice(start, end + 1);
         const originals = await storage.flatten(selected);

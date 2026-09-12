@@ -120,6 +120,23 @@ test("forced request: only collapse payload/execution, ignores stale raw context
   assert.deepEqual(states, [true, false]);
 });
 
+test("forced mode never deadlocks a valid selected range behind unrelated protected-tail candidates", async t => {
+  const messages = [
+    user("OLD_LARGE_A " + "a".repeat(7000), 1),
+    user("OLD_LARGE_B " + "b".repeat(7000), 2),
+    user("OLD_ELIGIBLE " + "c".repeat(1000), 3),
+    ...Array.from({ length: 10 }, (_, i) => user(`RECENT_${i} ` + "r".repeat(80), 10 + i)),
+  ];
+  const f = await fixture(t, messages, { protectRecent: 10 }, 6000);
+  await f.context();
+  assert.deepEqual(f.active(), ["collapse"]);
+  // The old policy rejected this because OLD_ELIGIBLE was independently
+  // collapsible and the protected tail alone was below the target.
+  const result = await f.collapse("OLD_LARGE_A", "RECENT_0", "Completed coherent historical work.");
+  assert.match(result.content[0].text, /protection waived/);
+  assert.equal((await f.context()).messages.length, 10);
+});
+
 test("normal recent protection, summary reduction, exact matching, no side effects on rejection", async t => {
   const f = await fixture(t, [user("OLD " + "x".repeat(1000)), user("RECENT " + "y".repeat(1000))], { protectRecent: 1 });
   await f.context();
