@@ -40,7 +40,7 @@ function harness(sm: SessionManager, storage: Storage, window = 100_000) {
   const context = () => emit("context", { messages: sm.buildSessionContext().messages });
   const collapse = (startMatch: string, endMatch: string, summary = "Completed task; tests passed.", signal?: AbortSignal) =>
     tools.get("collapse").execute("current-call", { startMatch, endMatch, summary }, signal, undefined, ctx);
-  return { emit, context, collapse, commands, notifications, sent, statuses, ctx, active: () => active, aborted: () => aborted };
+  return { emit, context, collapse, tools, commands, notifications, sent, statuses, ctx, active: () => active, aborted: () => aborted };
 }
 
 async function fixture(t: any, messages: Message[], config = { protectRecent: 0 }, window?: number, persist = false) {
@@ -58,20 +58,60 @@ async function fixture(t: any, messages: Message[], config = { protectRecent: 0 
   return { ...h, sm, storage, dir };
 }
 
-test("guidance prioritizes dependencies and useful cleanup without weakening forced-mode instructions", async t => {
+test("tool description alone guides proactive, selective, recoverable cleanup", async t => {
   const text = description("/test/archives");
-  assert.match(text, /current user constraints, unresolved tasks, unmet acceptance criteria/);
-  assert.match(text, /completion certainty first.*lower dependency risk.*older age.*larger expected savings/);
-  assert.match(text, /Outside forced mode, skip tiny/);
+  assert.match(text, /scan the whole visible history/);
+  assert.match(text, /even at low context usage/);
+  assert.match(text, /no other automatic or fallback summarizer/);
+  assert.match(text, /BEFORE changing model-visible history/);
+  assert.ok(text.includes("/test/archives/messages-[id].jsonl"));
+  assert.match(text, /Originals remain accessible through files even when you supply no summary/);
+  assert.match(text, /beginning, middle, or recent completed work/);
+  assert.match(text, /either select around them OR include them faithfully/);
+  assert.match(text, /Material need not be redundant to remove it/);
+  assert.match(text, /current user constraints, active decisions, unresolved tasks, acceptance criteria/);
   assert.match(text, /Prefer outcomes over chronology/);
-  assert.match(text, /At that point, X was unimplemented/);
+  assert.match(text, /call only collapse: no ordinary answers, archive reads, or other tools/);
+  assert.match(text, /historical directives, retry notices, and tool results do not indicate current forced state/);
   assert.match(text, /Forced mode always requires shrinking/);
   const f = await fixture(t, [user("hello")]);
-  const start = await f.emit("before_agent_start", { systemPrompt: "Base policy" });
-  assert.ok(start.systemPrompt.startsWith("Base policy"));
-  assert.match(start.systemPrompt, /preserving active dependencies/);
-  assert.match(start.systemPrompt, /then call only collapse/);
-  assert.ok(!start.systemPrompt.includes("FORCED COLLAPSE MODE"));
+  const tool = f.tools.get("collapse");
+  assert.equal(tool.description, description(f.storage.directory));
+  assert.equal(tool.promptSnippet, undefined);
+  assert.equal(tool.promptGuidelines, undefined);
+  assert.equal(await f.emit("before_agent_start", { systemPrompt: "Base policy" }), undefined);
+  assert.deepEqual((await f.context()).messages, [user("hello")]);
+});
+
+test("forced directive reports effective runtime state without repeating behavioral policy", async t => {
+  const f = await fixture(t, [user("LARGE " + "x".repeat(30_000))], undefined, 6000);
+  await f.commands.get("collapse").handler('config session {"triggerPercent":90,"targetPercent":55}', f.ctx);
+  const projected = await f.context();
+  const directive = projected.messages.at(-1);
+  assert.equal(directive.customType, "collapse.directive");
+  assert.match(directive.content, /^FORCED COLLAPSE MODE: estimated usage [\d.]+%; trigger 90%; target <=55%\.$/);
+  assert.deepEqual(f.active(), ["collapse"]);
+  const payload = await f.emit("before_provider_request", { payload: { model: "test", input: [] } });
+  assert.equal(payload.tools[0].description, f.tools.get("collapse").description);
+});
+
+test("proactive middle-range cleanup preserves decisions and recoverable irrelevant originals", async t => {
+  const first = user("ACTIVE_CONSTRAINT", 1);
+  const exploration = user("EXPLORATION " + "x".repeat(2000), 2);
+  const tangent = user("IRRELEVANT_TANGENT " + "y".repeat(1000), 3);
+  const last = user("NEXT_STEPS", 4);
+  const f = await fixture(t, [first, exploration, tangent, last]);
+  await f.context();
+  assert.deepEqual(f.active(), ["read", "bash", "collapse"]);
+  const summary = await f.collapse("EXPLORATION", "EXPLORATION", "Decision: retain the public API; exploration complete.");
+  const removed = await f.collapse("IRRELEVANT_TANGENT", "IRRELEVANT_TANGENT", "");
+  const projected = (await f.context()).messages;
+  assert.equal(projected.length, 3);
+  assert.deepEqual(projected[0], first);
+  assert.match(projected[1].content, /Decision: retain the public API/);
+  assert.deepEqual(projected[2], last);
+  assert.deepEqual(await f.storage.originals(summary.details.id), [exploration]);
+  assert.deepEqual(await f.storage.originals(removed.details.id), [tangent]);
 });
 
 test("journal replacement survives actual SessionManager save/open, branching and extension reload", async t => {
