@@ -5,6 +5,8 @@ export type Message = AgentMessage;
 export interface OriginalIdentity { hash: string; position: number }
 export interface Row {
   key: string; message: Message; collapseId?: string;
+  /** Unmodified audit message when projection removes only some assistant blocks. */
+  auditMessage?: Message;
   /** Runtime-only provenance from the audit history, never model-visible or archived. */
   originals?: OriginalIdentity[];
   originalCount?: number;
@@ -15,6 +17,8 @@ export interface Collapse {
   version: 1;
   /** Missing in legacy journals, whose keys used pre-JSON-normalization hashing. */
   identityVersion?: 2;
+  /** Selection used a projection without successful collapse bookkeeping. */
+  hideBookkeeping?: true;
   id: string;
   keys: string[];
   summary: string;
@@ -80,19 +84,29 @@ export function summaryRow(op: Collapse): Row {
   return {
     key: `collapse:${op.id}`, collapseId: op.id, originalCount: op.originalCount,
     message: { role: "custom", customType: "collapse.summary", display: true,
-      content: `[Collapsed ${op.id}; ${op.originalCount} original messages; archive: messages-${op.id}.jsonl]\n${op.summary}`,
+      content: `[Collapsed @collapse:${op.id}; ${op.originalCount} original messages; archive: messages-${op.id}.jsonl]\n${op.summary}`,
       timestamp: op.timestamp },
   };
 }
 
 export function validateCollapse(value: unknown): Collapse {
   const op = value as Collapse;
-  if (!op || op.version !== 1 || (op.identityVersion !== undefined && op.identityVersion !== 2) || !isArchiveId(op.id) || !Array.isArray(op.keys) || !op.keys.length ||
+  if (!op || op.version !== 1 || (op.identityVersion !== undefined && op.identityVersion !== 2) ||
+      (op.hideBookkeeping !== undefined && op.hideBookkeeping !== true) || !isArchiveId(op.id) || !Array.isArray(op.keys) || !op.keys.length ||
       op.keys.some(k => typeof k !== "string") || new Set(op.keys).size !== op.keys.length ||
       typeof op.summary !== "string" || (op.summary !== "" && !op.summary.trim()) || !Number.isFinite(op.timestamp) ||
       !Number.isSafeInteger(op.originalCount) || op.originalCount < 1 || !Array.isArray(op.supersedes) ||
       op.supersedes.some(id => !isArchiveId(id))) throw new Error("Invalid collapse journal entry");
   return op;
+}
+
+/** Pi can remove these responses before retry/overflow hooks run, even if compaction
+ * is cancelled. Never reconcile missing tool calls, aborted output, or user data. */
+function omittedByPi(message: Message): boolean {
+  return message.role === "assistant" && (
+    (message.stopReason === "error" && message.content.length === 0) ||
+    (message.stopReason === "length" && message.content.every(block => block.type === "text" || block.type === "thinking"))
+  );
 }
 
 export function apply(rows: Row[], op: Collapse): Row[] {
@@ -107,10 +121,10 @@ export function apply(rows: Row[], op: Collapse): Row[] {
   for (const key of op.keys) {
     while (rows[end] && !matchesKey(rows[end], key)) {
       const message = rows[end].message;
-      // Pi's automatic retry removes empty failed assistant responses from live
-      // context but retains them on disk. Never discard these audit records,
-      // and never tolerate inserted user content, tool calls, or partial output.
-      if (message.role !== "assistant" || message.stopReason !== "error" || message.content.length !== 0) throw conflict();
+      // Legacy operations may span a response omitted by Pi's retry/overflow
+      // lifecycle. Preserve it outside the replacement, never silently archive
+      // content that the original selection did not contain.
+      if (!omittedByPi(message)) throw conflict();
       retained.push(rows[end++]);
     }
     if (!rows[end]) throw conflict();
@@ -126,12 +140,13 @@ export function project(messages: Message[], operations: Collapse[]): Row[] {
 }
 
 /** Pi clones context before hooks (Buffer -> Uint8Array). Restore audit objects only
- * when the entire sequence matches exactly, allowing pi's omitted empty retries.
+ * when the entire sequence matches, allowing narrowly identified Pi omissions.
+ * Reinsert truncated text/thinking so new selections include the actual audit
+ * content. Empty retry errors retain their legacy omitted-live representation.
  * Never equate arbitrary typed arrays with Buffers or reconcile changed content. */
 export function restoreAuditMessages(messages: Message[], audit: Message[]): Message[] {
   const restored: Message[] = [];
   let cursor = 0;
-  const retry = (message: Message) => message.role === "assistant" && message.stopReason === "error" && message.content.length === 0;
   for (const message of messages) {
     const expected = messageFingerprint(message);
     let matched = false;
@@ -149,11 +164,15 @@ export function restoreAuditMessages(messages: Message[], audit: Message[]): Mes
         matched = true;
         break;
       }
-      if (!retry(original)) return messages;
+      if (!omittedByPi(original)) return messages;
+      if (original.role === "assistant" && original.stopReason === "length") restored.push(original);
     }
     if (!matched) return messages;
   }
-  return audit.slice(cursor).every(retry) ? restored : messages;
+  const tail = audit.slice(cursor);
+  if (!tail.every(omittedByPi)) return messages;
+  restored.push(...tail.filter(message => message.role === "assistant" && message.stopReason === "length"));
+  return restored;
 }
 
 // Search visible content, not details/usage/signatures containing hidden fork transcripts.
@@ -220,14 +239,14 @@ export function matchMessage(rows: Row[], match: string, label: string): number 
       const offset = Math.max(0, surface.indexOf(match) - 40);
       return `message ${i + 1} (${boundary(rows[i])}): ${JSON.stringify((offset ? "…" : "") + surface.slice(offset, offset + 180))}`;
     }).join("\n") : suggestions(rows, match);
-    throw new Error(`${label}: ${matches.length ? `ambiguous; matches messages ${matches.slice(0, 20).map(i => i + 1).join(", ")}` : "not found"}. Copy the intended candidate's exact reference for retry; literals are case- and whitespace-sensitive. Closest candidates (suggestions only):\n${candidates}`);
+    throw new Error(`${label}: ${matches.length ? `ambiguous; matches messages ${matches.slice(0, 20).map(i => i + 1).join(", ")}` : "not found"}. Copy the intended candidate's exact reference for retry; literals are case- and whitespace-sensitive. Use collapse action: "inspect" with query and offset to discover other matches. Closest candidates (suggestions only):\n${candidates}`);
   }
   return matches[0];
 }
 
-/** Expand to a fixed point, including every sibling call/result on an assistant message. */
-export function expandRange(rows: Row[], start: number, end: number): [number, number] {
-  if (start > end) throw new Error("startMatch must precede endMatch");
+interface ToolGroups { calls: Map<string, number[]>; results: Map<string, number[]> }
+
+function toolGroups(rows: Row[]): ToolGroups {
   const calls = new Map<string, number[]>();
   const results = new Map<string, number[]>();
   rows.forEach(({ message: m }, i) => {
@@ -236,6 +255,16 @@ export function expandRange(rows: Row[], start: number, end: number): [number, n
     }
     if (m.role === "toolResult") results.set(m.toolCallId, [...(results.get(m.toolCallId) ?? []), i]);
   });
+  return { calls, results };
+}
+
+/** Expand to a fixed point, including every sibling call/result on an assistant message. */
+export function expandRange(rows: Row[], start: number, end: number): [number, number] {
+  return expandIndexedRange(rows, start, end, toolGroups(rows));
+}
+
+function expandIndexedRange(rows: Row[], start: number, end: number, { calls, results }: ToolGroups): [number, number] {
+  if (start > end) throw new Error("startMatch must precede endMatch");
   let changed = true;
   while (changed) {
     changed = false;
@@ -257,9 +286,10 @@ export function expandRange(rows: Row[], start: number, end: number): [number, n
 export function eligibleRanges(rows: Row[], protectRecent: number): string {
   const candidates: { start: number; end: number; size: number }[] = [];
   const cutoff = Math.max(0, rows.length - protectRecent);
+  const groups = toolGroups(rows);
   for (let i = 0; i < cutoff; i++) {
     try {
-      const [start, end] = expandRange(rows, i, i);
+      const [start, end] = expandIndexedRange(rows, i, i, groups);
       if (start !== i || end >= cutoff) continue;
       candidates.push({ start, end, size: rows.slice(start, end + 1).reduce((sum, row) => sum + JSON.stringify(row.message).length, 0) });
       i = end;
@@ -268,6 +298,47 @@ export function eligibleRanges(rows: Row[], protectRecent: number): string {
   if (!candidates.length) return "No eligible complete ranges remain under current protection. Wait for more completed work; do not split tool groups.";
   return "Eligible complete ranges (largest serialized content first; inspect relevance before selecting; these are not instructions to discard):\n" + candidates.sort((a, b) => b.size - a.size).slice(0, 3).map(({ start, end }) =>
     `messages ${start + 1}–${end + 1}: ${JSON.stringify({ startMatch: boundary(rows[start]), endMatch: boundary(rows[end]) })}`).join("\n");
+}
+
+export interface MessageLookup {
+  total: number;
+  offset: number;
+  nextOffset: number | null;
+  protectRecent: number;
+  matches: Array<{
+    message: number; reference: string; role: Message["role"]; preview: string;
+    eligible: boolean;
+    range?: { startMatch: string; endMatch: string; firstMessage: number; lastMessage: number };
+    reason?: string;
+  }>;
+}
+
+/** Bounded exact-match discovery; offset counts matches, not history rows.
+ * References are stable identities, while message numbers are snapshot-local. */
+export function lookupMessages(rows: Row[], query = "", offset = 0, limit = 10, protectRecent = 0): MessageLookup {
+  if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 20 ||
+      !Number.isSafeInteger(protectRecent) || protectRecent < 0) throw new Error("Require nonnegative integer offset/protectRecent and integer limit 1–20");
+  const reference = query.startsWith("@collapse:") || query.startsWith("@message:");
+  const found = rows.flatMap((row, index) => {
+    const texts = surfaces(row.message);
+    const text = query === "" || reference ? texts[0] : texts.find(text => text.includes(query));
+    return (reference ? boundary(row) === query : text !== undefined) ? [{ row, index, text: text! }] : [];
+  });
+  const groups = toolGroups(rows);
+  const cutoff = Math.max(0, rows.length - protectRecent);
+  const matches = found.slice(offset, offset + limit).map(({ row, index, text }) => {
+    const previewStart = query && !reference ? Math.max(0, text.indexOf(query) - 40) : 0;
+    const item: MessageLookup["matches"][number] = { message: index + 1, reference: boundary(row), role: row.message.role,
+      preview: (previewStart ? "…" : "") + text.slice(previewStart, previewStart + 240), eligible: false };
+    try {
+      const [start, end] = expandIndexedRange(rows, index, index, groups);
+      item.range = { startMatch: boundary(rows[start]), endMatch: boundary(rows[end]), firstMessage: start + 1, lastMessage: end + 1 };
+      item.eligible = end < cutoff;
+      if (!item.eligible) item.reason = `Expanded range touches the protected latest ${protectRecent} messages`;
+    } catch (error) { item.reason = (error instanceof Error ? error.message : String(error)).slice(0, 240); }
+    return item;
+  });
+  return { total: found.length, offset, nextOffset: offset + matches.length < found.length ? offset + matches.length : null, protectRecent, matches };
 }
 
 export function selectRange(rows: Row[], startMatch: string, endMatch: string, protectRecent: number): [number, number] {

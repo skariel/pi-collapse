@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, stat, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { apply, boundary, eligibleRanges, DEFAULT_CONFIG, expandRange, identify, matchMessage, nextForced, project, restoreAuditMessages, selectRange, summaryRow, validateCollapse, validateConfig, type Collapse, type Message } from "../src/core.ts";
+import { apply, boundary, eligibleRanges, DEFAULT_CONFIG, expandRange, identify, lookupMessages, matchMessage, nextForced, project, restoreAuditMessages, selectRange, summaryRow, validateCollapse, validateConfig, type Collapse, type Message } from "../src/core.ts";
 import { Storage } from "../src/storage.ts";
 
 export const user = (content: string, timestamp = 1): Message => ({ role: "user", content, timestamp });
@@ -33,6 +33,48 @@ test("replay preserves retry-only empty errors omitted from live history, withou
     assert.throws(() => apply(identify([messages[0], inserted, ...messages.slice(1)]), operation(live)), /Cannot replay/);
   }
   assert.throws(() => apply(identify([messages[0], error, messages[3]]), operation(live)), /Cannot replay/);
+});
+
+test("truncated-response reconciliation restores omitted text/thinking before new selection and preserves legacy gaps", async t => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-collapse-truncated-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const storage = new Storage(dir);
+  const first = user("before", 1), last = user("after", 4);
+  const truncated = { ...assistant([]), stopReason: "length" as const, timestamp: 3,
+    content: [{ type: "thinking" as const, thinking: "Unverified exploration" }, { type: "text" as const, text: "Partial result" }] };
+  const error = { ...assistant([]), stopReason: "error" as const, timestamp: 2 };
+  const audit = [first, error, truncated, last];
+  const restored = restoreAuditMessages(structuredClone([first, last]), audit);
+  assert.deepEqual(restored, [first, truncated, last]);
+  const op = operation(identify(restored));
+  await storage.archive(op.id, restored);
+  const reopened = project(JSON.parse(JSON.stringify(audit)), [op]);
+  assert.deepEqual(reopened.map(row => row.message), [summaryRow(op).message, error]);
+  assert.deepEqual(await storage.flatten(reopened), audit, "Provenance keeps chronological audit order through recollapse");
+  for (const summary of ["legacy summary", ""]) {
+    const legacy = operation(identify([first, last]), summary);
+    const replayed = project(audit, [legacy]);
+    assert.deepEqual(replayed.map(row => row.message), [...(summary ? [summaryRow(legacy).message] : []), error, truncated],
+      "An old operation that omitted truncated output must retain it outside the replacement");
+  }
+  assert.deepEqual(restoreAuditMessages([first], [first, truncated]), [first, truncated], "Trailing truncation is restored too");
+  assert.deepEqual(restoreAuditMessages([], [truncated]), [truncated]);
+});
+
+test("truncation reconciliation never restores an arbitrary omission or an incomplete tool group", () => {
+  const first = user("before"), last = user("after", 4);
+  const truncated = { ...assistant([]), stopReason: "length" as const, content: [{ type: "text" as const, text: "Partial" }] };
+  const live = [first, last];
+  for (const omitted of [user("missing user"), { ...truncated, stopReason: "stop" as const },
+    { ...truncated, stopReason: "aborted" as const }, { ...truncated, stopReason: "error" as const },
+    { ...assistant(["orphan"]), stopReason: "length" as const }]) {
+    assert.equal(restoreAuditMessages(live, [first, omitted, last]), live);
+    assert.throws(() => project([first, omitted, last], [operation(identify(live))]), /Cannot replay/);
+  }
+  const changed = [first, user("changed last", 4)];
+  assert.equal(restoreAuditMessages(changed, [first, truncated, last]), changed, "No partial reconciliation on mismatch");
+  const reordered = [last, first];
+  assert.equal(restoreAuditMessages(reordered, [first, truncated, last]), reordered);
 });
 
 test("literal matching: case, spaces, decoded newlines, JSON and repeated occurrences within one message", () => {
@@ -114,10 +156,25 @@ test("protection failures suggest only bounded complete eligible ranges with usa
   for (const s of suggestions) assert.ok(selectRange(rows, s.startMatch, s.endMatch, 1)[1] < 4);
   assert.match(eligibleRanges(rows, 2), /messages 1–1/);
   assert.ok(!eligibleRanges(rows, 2).includes(boundary(rows[1])));
+  const lookup = lookupMessages(rows, boundary(rows[1]), 0, 10, 2).matches[0];
+  assert.equal(lookup.eligible, false, "A call before the protected tail can expand into it");
+  assert.equal(lookup.range?.lastMessage, 4);
+  assert.match(lookup.reason!, /protected latest 2/);
   assert.match(eligibleRanges(rows, rows.length), /No eligible/);
   assert.match(eligibleRanges(identify([assistant(["pending"])]), 0), /No eligible/);
   assert.throws(() => selectRange(rows, "new", "new", 1), /Eligible complete ranges/);
   assert.ok(eligibleRanges(identify(Array.from({ length: 20 }, (_, i) => user(String(i)))), 1).split("\n").length <= 4);
+});
+
+test("eligible-range discovery indexes tool groups once per snapshot", () => {
+  let reads = 0;
+  const rows = identify(Array.from({ length: 1000 }, (_, i) => user(String(i), i)));
+  for (const row of rows) {
+    const message = row.message;
+    Object.defineProperty(row, "message", { get() { reads++; return message; } });
+  }
+  assert.match(eligibleRanges(rows, 1), /Eligible complete ranges/);
+  assert.ok(reads < rows.length * 10, `Expected linear message visits for ordinary history; got ${reads}`);
 });
 
 test("threshold hysteresis and strict configuration validation", () => {

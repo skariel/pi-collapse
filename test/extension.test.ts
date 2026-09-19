@@ -84,10 +84,56 @@ test("forced directive reports effective runtime state without repeating behavio
   const projected = await f.context();
   const directive = projected.messages.at(-1);
   assert.equal(directive.customType, "collapse.directive");
-  assert.match(directive.content, /^FORCED COLLAPSE MODE: estimated usage [\d.]+%; trigger 90%; target <=55%\.$/);
+  assert.match(directive.content, /^FORCED COLLAPSE MODE: estimated usage [\d.]+%; trigger 90%; target <=55%\./);
+  assert.match(directive.content, /approximately \d+ tokens remain to free\. protectRecent: 0\./);
   assert.deepEqual(f.active(), ["collapse"]);
   const payload = await f.emit("before_provider_request", { payload: { model: "test", input: [] } });
   assert.equal(payload.tools[0].description, f.tools.get("collapse").description);
+});
+
+test("inspection pages through identical messages, reports protection, and never archives", async t => {
+  const f = await fixture(t, Array.from({ length: 5 }, (_, i) => user("IDENTICAL " + "x".repeat(2000), i)), { protectRecent: 1 });
+  await f.context();
+  const execute = (params: object) => f.tools.get("collapse").execute("inspection", params, undefined, undefined, f.ctx);
+  const first = await execute({ action: "inspect", query: "IDENTICAL", limit: 3 });
+  assert.equal(first.details.collapseInspection, true);
+  assert.equal(JSON.parse(first.content[0].text).nextOffset, 3);
+  const page = JSON.parse((await execute({ action: "inspect", query: "IDENTICAL", offset: 3 })).content[0].text);
+  assert.equal(page.total, 5);
+  assert.equal(page.protectRecent, 1);
+  assert.equal(page.matches[0].eligible, true);
+  assert.equal(page.matches[1].eligible, false);
+  assert.match(page.matches[1].reason, /protected/);
+  assert.equal(f.sm.getBranch().filter(e => e.type === "custom" && e.customType === OP_TYPE).length, 0);
+  await assert.rejects(execute({ action: "inspect", summary: "" }), /omit collapse fields/);
+  await assert.rejects(execute({}), /requires startMatch/);
+  await assert.rejects(execute({ startMatch: "x", endMatch: "x", summary: "", query: "x" }), /only for action/);
+  const reference = page.matches[0].reference;
+  await f.collapse(reference, reference, "Fourth occurrence archived.");
+});
+
+test("precommit audit validation rejects unseen intervening content before any archive write", async t => {
+  const messages = [user("FIRST " + "x".repeat(2000), 1), user("MISSING ACTIVE REQUIREMENT", 2), user("LAST " + "y".repeat(2000), 3)];
+  const f = await fixture(t, messages);
+  await f.emit("context", { messages: [messages[0], messages[2]] });
+  let writes = 0;
+  f.storage.archive = async () => { writes++; };
+  await assert.rejects(f.collapse("FIRST", "LAST", "Completed."), /Cannot replay/);
+  assert.equal(writes, 0);
+  assert.equal(f.sm.getBranch().filter(e => e.type === "custom" && e.customType === OP_TYPE).length, 0);
+});
+
+test("audit is revalidated after asynchronous archive publication", async t => {
+  const f = await fixture(t, [user("SOURCE " + "x".repeat(2000))]);
+  await f.context();
+  const archive = f.storage.archive.bind(f.storage);
+  f.storage.archive = async (...args) => {
+    await archive(...args);
+    const source = f.sm.getBranch().find(e => e.type === "message")!;
+    if (source.type === "message" && source.message.role === "user") source.message.content = "Changed by another extension";
+  };
+  await assert.rejects(f.collapse("SOURCE", "SOURCE", "Completed."), /Cannot replay/);
+  assert.equal(f.sm.getBranch().filter(e => e.type === "custom" && e.customType === OP_TYPE).length, 0);
 });
 
 test("proactive middle-range cleanup preserves decisions and recoverable irrelevant originals", async t => {
@@ -169,7 +215,9 @@ test("forced mode never deadlocks a valid selected range behind unrelated protec
   // collapsible and the protected tail alone was below the target.
   const result = await f.collapse("OLD_LARGE_A", "RECENT_0", "Completed coherent historical work.");
   assert.match(result.content[0].text, /protection waived/);
-  assert.equal((await f.context()).messages.length, 10);
+  const after = (await f.context()).messages;
+  assert.equal(after.length, 11);
+  assert.match(after.at(-1).content, /COLLAPSE SELECTION STATE: protectRecent: 10/);
 });
 
 test("normal recent protection, summary reduction, exact matching, no side effects on rejection", async t => {
@@ -282,10 +330,12 @@ test("empty removals still obey protection and archive-before-commit; independen
   const archive = f.storage.archive.bind(f.storage);
   f.storage.archive = async () => { throw new Error("disk full"); };
   await assert.rejects(f.collapse("REMOVE_A", "REMOVE_A", ""), /disk full/);
-  assert.equal((await f.context()).messages.length, 3);
+  assert.equal((await f.context()).messages.length, 4); // Three history rows plus request-local protection state.
   f.storage.archive = archive;
   await Promise.all([f.collapse("REMOVE_A", "REMOVE_A", ""), f.collapse("REMOVE_B", "REMOVE_B", "")]);
-  assert.deepEqual((await f.context()).messages, [user("PROTECTED")]);
+  const projected = (await f.context()).messages;
+  assert.deepEqual(projected.slice(0, -1), [user("PROTECTED")]);
+  assert.match(projected.at(-1).content, /protectRecent: 1/);
   await f.commands.get("collapse").handler("status", f.ctx);
   assert.equal(JSON.parse(f.notifications.at(-1)!).activeCollapses, 2);
 });

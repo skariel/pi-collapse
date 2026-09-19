@@ -4,7 +4,7 @@
   "description": "Agent-directed, archived range compaction for pi",
   "type": "module",
   "keywords": ["pi-package"],
-  "files": ["src", "README.md"],
+  "files": ["src", "README.md", "docs"],
   "pi": { "extensions": ["./src/index.ts"] },
   "scripts": {
     "test": "node --import tsx --test test/*.test.ts",

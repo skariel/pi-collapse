@@ -46,7 +46,9 @@ export class Storage {
   async flatten(rows: Row[]): Promise<Message[]> {
     const result: { message: Message; position?: number }[] = [];
     for (const row of rows) {
-      const messages = row.collapseId ? await this.originals(row.collapseId) : [row.message];
+      // Mixed assistant rows can hide collapse calls in the model-facing copy;
+      // archives and their fingerprints must still contain the exact audit original.
+      const messages = row.collapseId ? await this.originals(row.collapseId) : [row.auditMessage ?? row.message];
       const invalid = () => new Error(`Archive integrity check failed for ${row.collapseId ?? row.key}; no replacement was committed`);
       if (row.collapseId && row.originalCount !== undefined && messages.length !== row.originalCount) throw invalid();
       if (!row.originals) {

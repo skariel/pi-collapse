@@ -22,6 +22,26 @@ test("calibration uses actual forced tools but exit estimates retain the full no
   assert.ok(after > actual + 9000, "normal schemas were not silently calibrated away");
 });
 
+test("forced calibration accepts different captured prompts without discounting the normal prompt budget", () => {
+  const meter = new UsageMeter();
+  const rows = identify([{ role: "user", content: "retained history", timestamp: 1 }]);
+  const tools = [{ name: "collapse" }];
+  const normal = { api: "openai-responses", provider: "openai", model: "test", forced: false };
+  const forced = { ...normal, forced: true };
+  const normalPrompt = "Normal tool guidelines " + "n".repeat(16_000);
+  const forcedPrompt = "Base instructions only";
+  const normalBefore = meter.estimate(rows, normalPrompt, tools, normal);
+  // Entry into forcing retains the already-captured normal prompt. The next
+  // request captures the smaller prompt after setActiveTools rebuilt it.
+  for (const capturedPrompt of [normalPrompt, forcedPrompt]) {
+    const actual = meter.estimate(rows, capturedPrompt, tools, forced);
+    meter.sent(rows, capturedPrompt, tools, forced);
+    meter.received(response(actual, 0, "toolUse"));
+    assert.equal(meter.estimate(rows, normalPrompt, tools, normal), normalBefore);
+  }
+  assert.ok(normalBefore > meter.estimate(rows, forcedPrompt, tools, forced) + 3900);
+});
+
 test("provider input and cache counts calibrate prompt estimation; error/aborted outputs do not", () => {
   const meter = new UsageMeter();
   const rows = identify([{ role: "user", content: "hello", timestamp: 1 }]);
