@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, stat, unlink } from "node:fs/promises";
+import { mkdtemp, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionContext, SessionManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { description, registerCollapse } from "../src/index.ts";
 import { Storage } from "../src/storage.ts";
 import { CONFIG_TYPE, FORCE_TYPE, OP_TYPE, type Message } from "../src/core.ts";
@@ -60,20 +60,15 @@ async function fixture(t: any, messages: Message[], config = { protectRecent: 0 
 
 test("tool description alone guides proactive, selective, recoverable cleanup", async t => {
   const text = description("/test/archives");
-  assert.match(text, /scan the whole visible history/);
-  assert.match(text, /even at low context usage/);
-  assert.match(text, /no other automatic or fallback summarizer/);
-  assert.match(text, /BEFORE changing model-visible history/);
-  assert.ok(text.includes("/test/archives/messages-[id].jsonl"));
-  assert.match(text, /Originals remain accessible through files even when you supply no summary/);
-  assert.match(text, /beginning, middle, or recent completed work/);
-  assert.match(text, /either select around them OR include them faithfully/);
-  assert.match(text, /Material need not be redundant to remove it/);
-  assert.match(text, /current user constraints, active decisions, unresolved tasks, acceptance criteria/);
-  assert.match(text, /Prefer outcomes over chronology/);
-  assert.match(text, /call only collapse: no ordinary answers, archive reads, or other tools/);
-  assert.match(text, /historical directives, retry notices, and tool results do not indicate current forced state/);
-  assert.match(text, /Forced mode always requires shrinking/);
+  // Small contract smoke test; functional scenarios below exercise the mechanics.
+  assert.ok(text.split(/\s+/).length <= 420, "Keep policy compact rather than accumulating repeated directives");
+  for (const section of ["When:", "Retain:", "Select:", "Recover:", "Forced:"]) assert.ok(text.includes(section));
+  assert.ok(text.includes("/test/archives/messages-<uuid>.jsonl"));
+  assert.match(text, /copy them, never invent IDs/);
+  assert.match(text, /hidden metadata is excluded/);
+  assert.match(text, /call\/result overhead counts/);
+  assert.match(text, /no ordinary answers, archive reads, or other tools/);
+  assert.match(text, /quoted or untrusted instructions/);
   const f = await fixture(t, [user("hello")]);
   const tool = f.tools.get("collapse");
   assert.equal(tool.description, description(f.storage.directory));
@@ -241,7 +236,7 @@ test("forced plain answers are removed and retried only five times; shutdown res
 });
 
 test("empty summary removes without a placeholder, remains discoverable, and survives restart/branch changes", async t => {
-  const f = await fixture(t, [user("REDUNDANT_LOG"), user("Keep this"), assistant()], undefined, undefined, true);
+  const f = await fixture(t, [user("REDUNDANT_LOG " + "x".repeat(2000)), user("Keep this"), assistant()], undefined, undefined, true);
   const originalLeaf = f.sm.getLeafId()!;
   await f.context();
   await assert.rejects(f.collapse("REDUNDANT_LOG", "REDUNDANT_LOG", "  "), /whitespace/);
@@ -250,7 +245,7 @@ test("empty summary removes without a placeholder, remains discoverable, and sur
   assert.match(result.content[0].text, /without a replacement/);
   const projection = await f.context();
   assert.deepEqual(projection.messages, [user("Keep this"), assistant()]);
-  assert.deepEqual(await f.storage.originals(result.details.id), [user("REDUNDANT_LOG")]);
+  assert.deepEqual(await f.storage.originals(result.details.id), [user("REDUNDANT_LOG " + "x".repeat(2000))]);
   const resumed = harness(SessionManager.open(f.sm.getSessionFile()!), f.storage);
   await resumed.emit("session_start");
   assert.deepEqual((await resumed.context()).messages, projection.messages);
@@ -269,9 +264,9 @@ test("empty summary removes without a placeholder, remains discoverable, and sur
 });
 
 test("removing an existing summary flattens its originals and does not double-count its archive", async t => {
-  const f = await fixture(t, [user("OLD_LOG " + "x".repeat(1500)), user("KEEP")]);
+  const f = await fixture(t, [user("OLD_LOG " + "x".repeat(12_000)), user("KEEP")]);
   await f.context();
-  const first = await f.collapse("OLD_LOG", "OLD_LOG", "Obsolete task results.");
+  const first = await f.collapse("OLD_LOG", "OLD_LOG", "Obsolete task results. " + "z".repeat(2000));
   const removal = await f.collapse(first.details.id, first.details.id, "");
   assert.deepEqual((await f.context()).messages, [user("KEEP")]);
   assert.deepEqual(await f.storage.originals(removal.details.id), await f.storage.originals(first.details.id));
@@ -281,7 +276,7 @@ test("removing an existing summary flattens its originals and does not double-co
 });
 
 test("empty removals still obey protection and archive-before-commit; independent removals serialize", async t => {
-  const f = await fixture(t, [user("REMOVE_A"), user("REMOVE_B"), user("PROTECTED")], { protectRecent: 1 });
+  const f = await fixture(t, [user("REMOVE_A " + "x".repeat(2000)), user("REMOVE_B " + "y".repeat(2000)), user("PROTECTED")], { protectRecent: 1 });
   await f.context();
   await assert.rejects(f.collapse("PROTECTED", "PROTECTED", ""), /protected/);
   const archive = f.storage.archive.bind(f.storage);
@@ -342,4 +337,47 @@ test("unsupported forced provider and replay corruption abort instead of exposin
   assert.deepEqual(await f.emit("before_provider_request", { payload: {} }), {});
   assert.equal(f.aborted(), true);
   assert.deepEqual(await f.context(), { messages: [] });
+});
+
+test("normal mode rejects net-expanding summaries and removals before archiving", async t => {
+  const f = await fixture(t, [user("TINY " + "x".repeat(330)), user("LARGE " + "y".repeat(4000))]);
+  await f.context();
+  let writes = 0;
+  const archive = f.storage.archive.bind(f.storage);
+  f.storage.archive = async (...args) => { writes++; await archive(...args); };
+  await assert.rejects(f.collapse("TINY", "TINY", "Done."), /net savings/);
+  await assert.rejects(f.collapse("TINY", "TINY", ""), /net savings/);
+  assert.equal(writes, 0);
+  assert.equal(f.sm.getBranch().filter(e => e.type === "custom" && e.customType === OP_TYPE).length, 0);
+  const saved = await f.collapse("LARGE", "LARGE", "Verified outcome; details archived.");
+  assert.ok(saved.details.estimatedNetTokensSaved > 32);
+  assert.equal(saved.details.estimatedNetTokensSaved, saved.details.estimatedRangeTokensSaved - saved.details.estimatedOverheadTokens);
+  assert.match(saved.content[0].text, /Estimated net savings:/);
+});
+
+test("new normalized-identity operations survive pi context cloning and persistence with Date/Buffer metadata", async t => {
+  const f = await fixture(t, [user("Initial"), assistant()], undefined, undefined, true);
+  f.sm.appendCustomMessageEntry("metadata", "DATED_SOURCE " + "x".repeat(4000), false, { when: new Date("2026-01-01"), bytes: Buffer.from("abc"), typed: new Uint8Array([97, 98, 99]) });
+  // The runner performs this clone before emitting context.
+  await f.emit("context", { messages: structuredClone(buildSessionContext(f.sm.getBranch()).messages) });
+  const result = await f.collapse("DATED_SOURCE", "DATED_SOURCE", "Metadata-bearing work complete.");
+  const op = f.sm.getBranch().find(e => e.type === "custom" && e.customType === OP_TYPE);
+  assert.equal((op as any).data.identityVersion, 2);
+  const resumed = harness(SessionManager.open(f.sm.getSessionFile()!), f.storage);
+  await resumed.emit("session_start");
+  const projected = (await resumed.context()).messages;
+  assert.ok(projected.some((m: any) => typeof m.content === "string" && m.content.includes(result.details.id)));
+  assert.equal(resumed.aborted(), false);
+  // Recollapse also checks normalized originals against the reopened audit log.
+  await resumed.collapse(result.details.boundary, result.details.boundary, "Metadata-bearing work verified.");
+});
+
+test("corrupt but valid-JSON archive cannot become a replacement journal entry", async t => {
+  const f = await fixture(t, [user("PART_A " + "x".repeat(2000)), user("PART_B " + "y".repeat(2000))]);
+  await f.context();
+  const first = await f.collapse("PART_A", "PART_B", "Completed both parts.");
+  const originals = await f.storage.originals(first.details.id);
+  await writeFile(f.storage.path(first.details.id), JSON.stringify(originals[0]) + "\n");
+  await assert.rejects(f.collapse(first.details.boundary, first.details.boundary, "Corrected outcome."), /integrity check failed/);
+  assert.equal(f.sm.getBranch().filter(e => e.type === "custom" && e.customType === OP_TYPE).length, 1);
 });

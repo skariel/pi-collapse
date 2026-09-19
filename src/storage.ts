@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { link, mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
-import { DEFAULT_CONFIG, validateConfig, type Config, type Message, type Row } from "./core.ts";
+import { DEFAULT_CONFIG, isArchiveId, messageFingerprint, validateConfig, type Config, type Message, type Row } from "./core.ts";
 
 /** Archives are immutable. Superseded IDs remain for historical branches and forked sessions. */
 export class Storage {
   constructor(readonly directory: string) {}
   path(id: string): string {
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) throw new Error("Invalid archive ID");
+    if (!isArchiveId(id)) throw new Error("Invalid archive ID");
     return join(this.directory, `messages-${id}.jsonl`);
   }
   private async atomic(path: string, content: string, exclusive = false): Promise<void> {
@@ -44,11 +44,31 @@ export class Storage {
     return messages;
   }
   async flatten(rows: Row[]): Promise<Message[]> {
-    const result: Message[] = [];
+    const result: { message: Message; position?: number }[] = [];
     for (const row of rows) {
-      for (const message of row.collapseId ? await this.originals(row.collapseId) : [row.message]) result.push(message);
+      const messages = row.collapseId ? await this.originals(row.collapseId) : [row.message];
+      const invalid = () => new Error(`Archive integrity check failed for ${row.collapseId ?? row.key}; no replacement was committed`);
+      if (row.collapseId && row.originalCount !== undefined && messages.length !== row.originalCount) throw invalid();
+      if (!row.originals) {
+        // Standalone legacy callers can verify counts; projection supplies full provenance.
+        result.push(...messages.map(message => ({ message })));
+        continue;
+      }
+      if (messages.length !== row.originals.length) throw invalid();
+      const positions = new Map<string, number[]>();
+      for (const original of row.originals) positions.set(original.hash, [...(positions.get(original.hash) ?? []), original.position]);
+      for (const list of positions.values()) list.sort((a, b) => a - b);
+      for (const message of messages) {
+        const position = positions.get(messageFingerprint(message))?.shift();
+        if (position === undefined) throw invalid();
+        result.push({ message, position });
+      }
     }
-    return result;
+    // Retry audit errors may sit after a projected summary although they occurred
+    // between its originals. Audit positions recover order even for tied timestamps
+    // and for archives written in the old, incorrectly concatenated order.
+    if (result.every(item => item.position !== undefined)) result.sort((a, b) => a.position! - b.position!);
+    return result.map(item => item.message);
   }
   async config(): Promise<Config> {
     try {

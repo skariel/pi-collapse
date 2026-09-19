@@ -9,6 +9,29 @@ export interface CollapseToolDefinition {
   parameters: unknown;
 }
 
+import type { Row } from "./core.ts";
+
+export interface RequestProfile {
+  api?: string;
+  provider?: string;
+  model?: string;
+  /** Normal and forced requests use separate calibration: their serialization differs. */
+  forced?: boolean;
+}
+
+const EMPTY_CONTENT = "[No retained content]";
+
+/** Mirror forced Anthropic history filtering for token estimation, without mutating history. */
+export function estimationRows(rows: Row[], profile: RequestProfile): Row[] {
+  if (!profile.forced || profile.api !== "anthropic-messages") return rows;
+  return rows.map(row => {
+    if (row.message.role !== "assistant") return row;
+    const content = row.message.content.filter(block => block.type !== "thinking");
+    if (content.length === row.message.content.length) return row;
+    return { ...row, message: { ...row.message, content: content.length ? content : [{ type: "text", text: EMPTY_CONTENT }] } };
+  });
+}
+
 type RecordValue = Record<string, unknown>;
 export const SUPPORTED_APIS = [
   "openai-completions",
@@ -46,6 +69,32 @@ function responsesInput(input: unknown[]): unknown[] {
   });
 }
 
+/** Kimi can serialize deferred declarations as system messages, not top-level tools. */
+function completionsMessages(messages: unknown[]): unknown[] {
+  let changed = false;
+  const result = messages.flatMap(message => {
+    const value = record(message, "OpenAI message");
+    if (!("tools" in value)) return [message];
+    changed = true;
+    const retained = without(value, ["tools"]);
+    // Pi's declaration-only system messages have no content at all.
+    if (retained.role === "system" && retained.content == null) return [];
+    return [retained];
+  });
+  return changed ? result : messages;
+}
+
+/** Follow the serializer's compatibility decision; unknown support means omit strict. */
+function serializedStrictSupport(original: RecordValue, api: string): boolean {
+  if (!Array.isArray(original.tools)) return false;
+  return original.tools.some(tool => {
+    if (!tool || typeof tool !== "object") return false;
+    const value = tool as RecordValue;
+    const definition = api === "openai-completions" ? value.function : value;
+    return value.type === "function" && !!definition && typeof definition === "object" && "strict" in definition;
+  });
+}
+
 function anthropicContent(content: unknown): unknown {
   if (typeof content === "string") return content;
   const blocks = array(content, "Anthropic content").flatMap((block) => {
@@ -58,7 +107,7 @@ function anthropicContent(content: unknown): unknown {
     }
     return [value];
   });
-  return blocks.length ? blocks : [{ type: "text", text: "[No retained content]" }];
+  return blocks.length ? blocks : [{ type: "text", text: EMPTY_CONTENT }];
 }
 
 /** Pure: never mutates payload, schema, or tool definition. Throws on unsupported APIs/shapes. */
@@ -83,13 +132,13 @@ export function restrictPayload(
     name: "collapse",
     description: collapseTool.description,
     parameters: schema,
-    strict: false,
+    ...(serializedStrictSupport(original, api) ? { strict: false } : {}),
   };
 
   if (api === "openai-completions") {
-    array(original.messages, "OpenAI messages");
     return {
       ...without(original, ["functions", "function_call", "response_format"]),
+      messages: completionsMessages(array(original.messages, "OpenAI messages")),
       tools: [{ type: "function", function: functionDefinition }],
       tool_choice: { type: "function", function: { name: "collapse" } },
       parallel_tool_calls: false,

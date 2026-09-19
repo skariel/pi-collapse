@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { restrictPayload, SUPPORTED_APIS } from "../src/provider.ts";
+import { stream } from "@earendil-works/pi-ai/api/openai-completions";
+import type { Context, Model } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 
 const tool = {
   name: "collapse",
@@ -19,7 +22,7 @@ function freezeDeep<T>(value: T): T {
 
 test("completions replaces every tool and legacy function, forces collapse, preserves messages", () => {
   const payload = freezeDeep({ model: "gpt", messages: [{ role: "user", content: "x" }],
-    tools: [{ type: "function", function: { name: "bash" } }, { type: "web_search" }],
+    tools: [{ type: "function", function: { name: "bash", strict: true } }, { type: "web_search" }],
     functions: [{ name: "read" }], function_call: "auto", response_format: { type: "json_object" },
     tool_choice: "auto", parallel_tool_calls: true, temperature: 0.1 });
   const result = restrict("openai-completions", payload);
@@ -40,7 +43,7 @@ for (const api of ["openai-responses", "openai-codex-responses", "azure-openai-r
       { type: "additional_tools", tools: [{ name: "read" }] },
       { type: "tool_search_call", call_id: "load" },
       { type: "tool_search_output", call_id: "load", tools: [{ name: "write" }] }],
-      tools: [{ type: "web_search" }, { type: "mcp", server_label: "remote" }],
+      tools: [{ type: "function", name: "bash", strict: false }, { type: "web_search" }, { type: "mcp", server_label: "remote" }],
       text: { verbosity: "low", format: { type: "json_schema" } },
       reasoning: { effort: "high" } });
     const result = restrict(api, payload);
@@ -125,6 +128,65 @@ test("rejects unsupported APIs, malformed payloads and wrong tool definitions", 
   assert.throws(() => restrictPayload("openai-completions", {}, { ...tool, name: "bash" }), /definition/);
   assert.throws(() => restrictPayload("openai-completions", {}, { ...tool, parameters: [] }), /parameters/);
   assert.equal(SUPPORTED_APIS.length, 7);
+});
+
+test("OpenAI adapters omit strict when the serialized provider tools omit it", () => {
+  const completions = restrict("openai-completions", { model: "gpt", messages: [], tools: [{ type: "function", function: { name: "bash" } }] });
+  assert.equal("strict" in completions.tools[0].function, false);
+  for (const api of ["openai-responses", "openai-codex-responses", "azure-openai-responses"]) {
+    const result = restrict(api, { model: "gpt", input: [], tools: [{ type: "function", name: "bash" }] });
+    assert.equal("strict" in result.tools[0], false);
+    assert.equal("strict" in restrict(api, { model: "gpt", input: [] }).tools[0], false);
+  }
+});
+
+test("Kimi declaration fields are removed without removing system content or tool pairs", () => {
+  const payload = freezeDeep({ model: "kimi", messages: [
+    { role: "system", tools: [{ name: "bash" }] },
+    { role: "system", content: "Retain these instructions", tools: [{ name: "read" }] },
+    { role: "assistant", tool_calls: [{ id: "old", type: "function", function: { name: "bash", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "old", content: "done" },
+  ] });
+  const result = restrict("openai-completions", payload);
+  assert.deepEqual(result.messages, [
+    { role: "system", content: "Retain these instructions" }, ...payload.messages.slice(2),
+  ]);
+  assert.ok(payload.messages[0].tools);
+});
+
+test("real pi Kimi serializer: deferred declarations and strict compatibility survive restriction correctly", async () => {
+  const model: Model<"openai-completions"> = {
+    id: "kimi", name: "Kimi", api: "openai-completions", provider: "moonshot", baseUrl: "http://127.0.0.1:1/v1",
+    reasoning: false, input: ["text"], contextWindow: 128000, maxTokens: 1000,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    compat: { supportsStrictMode: false, deferredToolsMode: "kimi" },
+  };
+  const context: Context = {
+    messages: [
+      { role: "user", content: "Load bash", timestamp: 1 },
+      { role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: 2,
+        content: [{ type: "toolCall", id: "load", name: "tool_search", arguments: {} }], stopReason: "toolUse",
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } },
+      { role: "toolResult", toolCallId: "load", toolName: "tool_search", addedToolNames: ["bash"],
+        content: [{ type: "text", text: "loaded" }], isError: false, timestamp: 3 },
+    ],
+    tools: [{ name: "tool_search", description: "Load tools", parameters: Type.Object({}) },
+      { name: "bash", description: "Execute", parameters: Type.Object({ command: Type.String() }) }],
+  };
+  let captured: Record<string, any> | undefined;
+  const result = await stream(model, context, { apiKey: "test-key", onPayload(payload) {
+    captured = payload as Record<string, any>;
+    throw new Error("test: stop before network");
+  } }).result();
+  assert.match(result.errorMessage ?? "", /stop before network/);
+  assert.ok(captured, "serializer reached payload hook");
+  assert.ok(captured.messages.some((message: any) => message.tools?.length));
+  assert.equal("strict" in captured.tools[0].function, false);
+  const restricted = restrict("openai-completions", captured);
+  assert.equal(restricted.messages.some((message: any) => "tools" in message), false);
+  assert.equal("strict" in restricted.tools[0].function, false);
+  assert.equal(restricted.messages.filter((message: any) => message.role === "tool").length, 1);
 });
 
 test("never mutates a deeply frozen tool schema", () => {

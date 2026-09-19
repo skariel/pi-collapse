@@ -2,9 +2,19 @@ import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 
 export type Message = AgentMessage;
-export interface Row { key: string; message: Message; collapseId?: string }
+export interface OriginalIdentity { hash: string; position: number }
+export interface Row {
+  key: string; message: Message; collapseId?: string;
+  /** Runtime-only provenance from the audit history, never model-visible or archived. */
+  originals?: OriginalIdentity[];
+  originalCount?: number;
+  legacyKey?: string;
+}
+export const isArchiveId = (value: unknown): value is string => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
 export interface Collapse {
   version: 1;
+  /** Missing in legacy journals, whose keys used pre-JSON-normalization hashing. */
+  identityVersion?: 2;
   id: string;
   keys: string[];
   summary: string;
@@ -31,29 +41,44 @@ export function validateConfig(value: unknown): Config {
   return { triggerPercent, targetPercent, protectRecent };
 }
 
-export function canonical(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+function legacyCanonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(legacyCanonical).join(",")}]`;
   if (value && typeof value === "object") return `{${Object.entries(value).filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => `${JSON.stringify(k)}:${legacyCanonical(v)}`).join(",")}}`;
   return JSON.stringify(value) ?? "null";
 }
 
+/** Hash the JSON representation that pi persists, including toJSON and sparse arrays. */
+export function canonical(value: unknown): string {
+  const json = JSON.stringify(value);
+  return legacyCanonical(json === undefined ? null : JSON.parse(json));
+}
+
+function identityValue(message: Message): unknown {
+  // Pi regenerates custom-message timestamps when persisting/rebuilding them.
+  return message.role === "custom" ? { ...message, timestamp: undefined } : message;
+}
+const hashValue = (value: string) => createHash("sha256").update(value).digest("hex");
+export const messageFingerprint = (message: Message): string => hashValue(canonical(identityValue(message)));
+
 export function identify(messages: Message[]): Row[] {
   const counts = new Map<string, number>();
-  return messages.map(message => {
-    // Pi regenerates custom-message timestamps when persisting/rebuilding them.
-    // Ignore only that unstable field; occurrence ordinals distinguish duplicates.
-    const identity = message.role === "custom" ? { ...message, timestamp: undefined } : message;
-    const hash = createHash("sha256").update(canonical(identity)).digest("hex");
+  const legacyCounts = new Map<string, number>();
+  return messages.map((message, position) => {
+    const hash = messageFingerprint(message);
+    const legacyHash = hashValue(legacyCanonical(identityValue(message)));
     const occurrence = counts.get(hash) ?? 0;
     counts.set(hash, occurrence + 1);
-    return { key: `${hash}:${occurrence}`, message };
+    const legacyOccurrence = legacyCounts.get(legacyHash) ?? 0;
+    legacyCounts.set(legacyHash, legacyOccurrence + 1);
+    const key = `${hash}:${occurrence}`, legacyKey = `${legacyHash}:${legacyOccurrence}`;
+    return { key, message, originals: [{ hash, position }], ...(legacyKey !== key ? { legacyKey } : {}) };
   });
 }
 
 export function summaryRow(op: Collapse): Row {
   return {
-    key: `collapse:${op.id}`, collapseId: op.id,
+    key: `collapse:${op.id}`, collapseId: op.id, originalCount: op.originalCount,
     message: { role: "custom", customType: "collapse.summary", display: true,
       content: `[Collapsed ${op.id}; ${op.originalCount} original messages; archive: messages-${op.id}.jsonl]\n${op.summary}`,
       timestamp: op.timestamp },
@@ -62,22 +87,25 @@ export function summaryRow(op: Collapse): Row {
 
 export function validateCollapse(value: unknown): Collapse {
   const op = value as Collapse;
-  if (!op || op.version !== 1 || !/^[0-9a-f-]{36}$/.test(op.id) || !Array.isArray(op.keys) || !op.keys.length ||
+  if (!op || op.version !== 1 || (op.identityVersion !== undefined && op.identityVersion !== 2) || !isArchiveId(op.id) || !Array.isArray(op.keys) || !op.keys.length ||
       op.keys.some(k => typeof k !== "string") || new Set(op.keys).size !== op.keys.length ||
       typeof op.summary !== "string" || (op.summary !== "" && !op.summary.trim()) || !Number.isFinite(op.timestamp) ||
       !Number.isSafeInteger(op.originalCount) || op.originalCount < 1 || !Array.isArray(op.supersedes) ||
-      op.supersedes.some(id => typeof id !== "string" || !/^[0-9a-f-]{36}$/.test(id))) throw new Error("Invalid collapse journal entry");
+      op.supersedes.some(id => !isArchiveId(id))) throw new Error("Invalid collapse journal entry");
   return op;
 }
 
 export function apply(rows: Row[], op: Collapse): Row[] {
-  const start = rows.findIndex(r => r.key === op.keys[0]);
+  // Do not mix namespaces: a legacy Date hash can equal a new plain-object hash.
+  const matchesKey = (row: Row, key: string) => (op.identityVersion === 2 ? row.key : row.legacyKey ?? row.key) === key;
+  const start = rows.findIndex(r => matchesKey(r, op.keys[0]));
   const conflict = () => new Error(`Cannot replay collapse ${op.id}: history changed or another context extension conflicts. No history was discarded.`);
   if (start < 0) throw conflict();
   let end = start;
   const retained: Row[] = [];
+  const selected: Row[] = [];
   for (const key of op.keys) {
-    while (rows[end] && rows[end].key !== key) {
+    while (rows[end] && !matchesKey(rows[end], key)) {
       const message = rows[end].message;
       // Pi's automatic retry removes empty failed assistant responses from live
       // context but retains them on disk. Never discard these audit records,
@@ -86,24 +114,67 @@ export function apply(rows: Row[], op: Collapse): Row[] {
       retained.push(rows[end++]);
     }
     if (!rows[end]) throw conflict();
-    end++;
+    selected.push(rows[end++]);
   }
-  return [...rows.slice(0, start), ...(op.summary === "" ? [] : [summaryRow(op)]), ...retained, ...rows.slice(end)];
+  const replacement = summaryRow(op);
+  if (selected.every(row => row.originals)) replacement.originals = selected.flatMap(row => row.originals!);
+  return [...rows.slice(0, start), ...(op.summary === "" ? [] : [replacement]), ...retained, ...rows.slice(end)];
 }
 
 export function project(messages: Message[], operations: Collapse[]): Row[] {
   return operations.reduce(apply, identify(messages));
 }
 
-// Literal JSON plus individual decoded string values: raw newlines and spaces remain matchable.
+/** Pi clones context before hooks (Buffer -> Uint8Array). Restore audit objects only
+ * when the entire sequence matches exactly, allowing pi's omitted empty retries.
+ * Never equate arbitrary typed arrays with Buffers or reconcile changed content. */
+export function restoreAuditMessages(messages: Message[], audit: Message[]): Message[] {
+  const restored: Message[] = [];
+  let cursor = 0;
+  const retry = (message: Message) => message.role === "assistant" && message.stopReason === "error" && message.content.length === 0;
+  for (const message of messages) {
+    const expected = messageFingerprint(message);
+    let matched = false;
+    while (cursor < audit.length) {
+      const original = audit[cursor++];
+      let same = messageFingerprint(original) === expected;
+      if (!same) {
+        try { same = messageFingerprint(structuredClone(original)) === expected; }
+        catch { /* Non-cloneable extension data is not safe to reconcile. */ }
+      }
+      if (same) {
+        // Custom timestamps are intentionally outside identity; retain the live value.
+        restored.push(original.role === "custom" && message.role === "custom" && original.timestamp !== message.timestamp
+          ? { ...original, timestamp: message.timestamp } : original);
+        matched = true;
+        break;
+      }
+      if (!retry(original)) return messages;
+    }
+    if (!matched) return messages;
+  }
+  return audit.slice(cursor).every(retry) ? restored : messages;
+}
+
+// Search visible content, not details/usage/signatures containing hidden fork transcripts.
+// Still expose compact JSON for matching tool arguments and decoded strings for raw text.
 export function surfaces(message: Message): string[] {
-  const result = [JSON.stringify(message)];
+  let visible: unknown;
+  if (message.role === "bashExecution") visible = { role: message.role, command: message.command, output: message.output };
+  else if (message.role === "branchSummary" || message.role === "compactionSummary") visible = { role: message.role, summary: message.summary };
+  else visible = { role: message.role, content: typeof message.content === "string" ? message.content : message.content.map(block => {
+    if (block.type === "text") return { type: block.type, text: block.text };
+    if (block.type === "thinking") return { type: block.type, thinking: block.thinking };
+    if (block.type === "toolCall") return { type: block.type, id: block.id, name: block.name, arguments: block.arguments };
+    return { type: block.type }; // Binary image data and opaque signatures are not selectors.
+  }) };
+  const result = [JSON.stringify(visible)];
   function visit(value: unknown) {
     if (typeof value === "string") result.push(value);
     else if (Array.isArray(value)) value.forEach(visit);
     else if (value && typeof value === "object") Object.values(value).forEach(visit);
   }
-  visit(message);
+  visit(visible);
   return result;
 }
 
@@ -138,9 +209,19 @@ export function boundary(row: Row): string {
 export function matchMessage(rows: Row[], match: string, label: string): number {
   if (!match.length) throw new Error(`${label} cannot be empty`);
   // References resolve metadata, never incidental copies in tool arguments/results.
-  const reference = /^@collapse:[0-9a-f-]{36}$/.test(match) || /^@message:[0-9a-f]{64}:\d+$/.test(match);
+  if (match.startsWith("@collapse:") && !isArchiveId(match.slice("@collapse:".length))) throw new Error(`${label}: invalid collapse reference. Copy an exact returned reference; do not invent IDs.`);
+  if (match.startsWith("@message:") && !/^@message:[0-9a-f]{64}:\d+$/.test(match)) throw new Error(`${label}: invalid message reference. Copy an exact returned reference; do not invent IDs.`);
+  const reference = match.startsWith("@collapse:") || match.startsWith("@message:");
   const matches = rows.flatMap((r, i) => (reference ? boundary(r) === match : surfaces(r.message).some(text => text.includes(match))) ? [i] : []);
-  if (matches.length !== 1) throw new Error(`${label}: ${matches.length ? `ambiguous; matches messages ${matches.slice(0, 20).map(i => i + 1).join(", ")}` : "not found"}. Use a longer exact, case- and whitespace-sensitive substring. Closest candidates (suggestions only):\n${suggestions(rows, match)}`);
+  if (matches.length !== 1) {
+    if (reference) throw new Error(`${label}: reference not found in current history. It may be superseded, removed, or from another session. Use a current returned reference or visible content.`);
+    const candidates = matches.length ? matches.slice(0, 3).map(i => {
+      const surface = surfaces(rows[i].message).find(text => text.includes(match))!;
+      const offset = Math.max(0, surface.indexOf(match) - 40);
+      return `message ${i + 1} (${boundary(rows[i])}): ${JSON.stringify((offset ? "…" : "") + surface.slice(offset, offset + 180))}`;
+    }).join("\n") : suggestions(rows, match);
+    throw new Error(`${label}: ${matches.length ? `ambiguous; matches messages ${matches.slice(0, 20).map(i => i + 1).join(", ")}` : "not found"}. Copy the intended candidate's exact reference for retry; literals are case- and whitespace-sensitive. Closest candidates (suggestions only):\n${candidates}`);
+  }
   return matches[0];
 }
 
@@ -190,7 +271,16 @@ export function eligibleRanges(rows: Row[], protectRecent: number): string {
 }
 
 export function selectRange(rows: Row[], startMatch: string, endMatch: string, protectRecent: number): [number, number] {
-  const range = expandRange(rows, matchMessage(rows, startMatch, "startMatch"), matchMessage(rows, endMatch, "endMatch"));
+  const resolved: number[] = [], errors: string[] = [];
+  for (const [label, match] of [["startMatch", startMatch], ["endMatch", endMatch]]) {
+    try { resolved.push(matchMessage(rows, match, label)); }
+    catch (error) { resolved.push(-1); errors.push(String(error instanceof Error ? error.message : error)); }
+  }
+  if (errors.length) {
+    const valid = resolved.flatMap((index, i) => index < 0 ? [] : [`${i === 0 ? "startMatch" : "endMatch"} resolved: ${boundary(rows[index])}`]);
+    throw new Error([...errors, ...valid].join("\n"));
+  }
+  const range = expandRange(rows, resolved[0], resolved[1]);
   if (range[1] >= rows.length - protectRecent) throw new Error(`Range expanded to messages ${range[0] + 1}–${range[1] + 1} (including complete tool groups) touches the protected latest ${protectRecent} messages.\n${eligibleRanges(rows, protectRecent)}`);
   return range;
 }

@@ -171,26 +171,26 @@ for (const remove of [false, true]) test(`real agent loop: forced ${remove ? "re
   assert.equal(resumed.requests.length, 1);
 });
 
-test("real agent loop: valid but net-expanding collapses do not reset the no-progress bound", async t => {
+test("real agent loop: net-expanding collapses are rejected and retries remain bounded", async t => {
   const f = await setup(t, { seed(sm) {
     sm.appendMessage({ role: "user", content: "UNTOUCHED_LARGE_TASK " + "x".repeat(22_000), timestamp: 1 });
     for (let i = 0; i < 5; i++) sm.appendMessage({ role: "user", content: `SMALL_${i} ` + "y".repeat(330), timestamp: i + 2 });
     sm.appendCustomEntry(CONFIG_TYPE, { triggerPercent: 85, targetPercent: 50, protectRecent: 0 });
   } });
   f.script((index, request) => {
-    assert.ok(index < 5, "Successful operations that grow full context must not count as progress");
+    assert.ok(index < 5, "Rejected operations must not count as progress");
     assert.deepEqual(tools(request), ["collapse"]);
     return [call(`small_collapse_${index}`, "collapse", { startMatch: `SMALL_${index}`, endMatch: `SMALL_${index}`, summary: "Done." })];
   });
   await prompt(f.session, "Continue");
   assert.deepEqual(f.errors, []);
   assert.equal(f.requests.length, 5);
-  assert.equal(operations(f.sm).length, 5, "All five range reductions were valid and committed");
+  assert.equal(operations(f.sm).length, 0, "No net-expanding replacement may be committed");
   const results = f.session.messages.filter(message => message.role === "toolResult" && message.toolName === "collapse");
   assert.equal(results.length, 5);
-  assert.ok(results.every(message => message.role === "toolResult" && !message.isError));
+  assert.ok(results.every(message => message.role === "toolResult" && message.isError && JSON.stringify(message.content).includes("net savings")));
   assert.ok(allText(f.requests[4]).length > allText(f.requests[0]).length,
-    "Actual call/result overhead grows the request despite individual range reductions");
+    "Rejected calls still have overhead, so the retry bound remains necessary");
 });
 
 test("real agent loop: ignored forced tool choice retries at most five times and suppresses final text", async t => {
