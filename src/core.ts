@@ -19,6 +19,8 @@ export interface Collapse {
   identityVersion?: 2;
   /** Selection used a projection without successful collapse bookkeeping. */
   hideBookkeeping?: true;
+  /** Retain a minimal completion receipt when hiding this operation's call. */
+  receipt?: true;
   id: string;
   keys: string[];
   summary: string;
@@ -92,7 +94,8 @@ export function summaryRow(op: Collapse): Row {
 export function validateCollapse(value: unknown): Collapse {
   const op = value as Collapse;
   if (!op || op.version !== 1 || (op.identityVersion !== undefined && op.identityVersion !== 2) ||
-      (op.hideBookkeeping !== undefined && op.hideBookkeeping !== true) || !isArchiveId(op.id) || !Array.isArray(op.keys) || !op.keys.length ||
+      (op.hideBookkeeping !== undefined && op.hideBookkeeping !== true) ||
+      (op.receipt !== undefined && (op.receipt !== true || op.hideBookkeeping !== true)) || !isArchiveId(op.id) || !Array.isArray(op.keys) || !op.keys.length ||
       op.keys.some(k => typeof k !== "string") || new Set(op.keys).size !== op.keys.length ||
       typeof op.summary !== "string" || (op.summary !== "" && !op.summary.trim()) || !Number.isFinite(op.timestamp) ||
       !Number.isSafeInteger(op.originalCount) || op.originalCount < 1 || !Array.isArray(op.supersedes) ||

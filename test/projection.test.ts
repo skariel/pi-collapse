@@ -5,7 +5,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { boundary, expandRange, identify, project, summaryRow, validateCollapse, type Collapse, type Message, type Row } from "../src/core.ts";
-import { hideBookkeeping, projectHistory } from "../src/projection.ts";
+import { completionReceipt, hideBookkeeping, projectHistory } from "../src/projection.ts";
 import { Storage } from "../src/storage.ts";
 
 type Assistant = Extract<Message, { role: "assistant" }>;
@@ -68,8 +68,8 @@ test("a successful sibling disappears while a failed collapse sibling and its fe
   assert.deepEqual(expandRange(rows, 2, 2), [1, 2]);
 });
 
-test("incomplete, ambiguous, stale and mismatched successful-looking bookkeeping is not removed", () => {
-  const op = operation(identify([user("source")]));
+test("incomplete, ambiguous, stale and mismatched successful-looking bookkeeping is not removed or given receipts", () => {
+  const op: Collapse = { ...operation(identify([user("source")])), receipt: true };
   const validCall = assistant([call(op)]), validResult = result(op);
   const variants: Message[][] = [
     [validCall], [validResult], [validResult, validCall],
@@ -169,9 +169,73 @@ test("archives keep exact mixed audit originals and validate them through nested
   await assert.rejects(storage.flatten(projected), /Archive integrity check failed/);
 });
 
+for (const summary of ["Unique retained decision", ""]) test(`completion receipts survive ${summary ? "summary" : "removal"} projection and reopen without duplicated content`, async t => {
+  const dir = await mkdtemp(join(tmpdir(), "collapse-receipt-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const storage = new Storage(dir);
+  const source = user("source"), request = user("collapse some messages", 2);
+  const op: Collapse = { ...operation(identify([source]), summary), receipt: true };
+  const caller = assistant([call(op)], 3);
+  const messages = [source, request, caller, result(op)];
+  const raw = structuredClone(messages);
+  const rows = projectHistory(messages, [op]);
+  const receipt = rows.at(-1)!;
+  assert.equal(receipt.message.role, "assistant");
+  if (receipt.message.role === "assistant") {
+    assert.deepEqual(receipt.message.content, [{ type: "text", text: completionReceipt(op.id) }]);
+  }
+  assert.equal(rows.at(-2)!.message, request, "Completion evidence follows the user's request");
+  assert.equal(receipt.key, identify(messages)[2].key);
+  assert.equal(receipt.auditMessage, caller);
+  assert.deepEqual(await storage.flatten([receipt]), [caller], "Receipt archives retain exact audit provenance");
+  assert.deepEqual(hideBookkeeping(rows, [op]), rows, "No duplicate receipts on reprojection");
+  assert.deepEqual(projectHistory(JSON.parse(JSON.stringify(messages)), [validateCollapse(op)]), rows);
+  assert.deepEqual(messages, raw);
+
+  await storage.archive(op.id, [source]);
+  const next: Collapse = { ...operation(rows, "Combined"), receipt: true };
+  const originals = await storage.flatten(rows);
+  await storage.archive(next.id, originals);
+  messages.push(assistant([call(next, "next")], 5), result(next, "next"));
+  const nested = projectHistory(messages, [op, next]);
+  assert.equal(nested.length, 2);
+  assert.deepEqual(await storage.flatten(nested.slice(0, 1)), originals);
+  assert.ok(!JSON.stringify(nested.map(row => row.message)).includes(completionReceipt(op.id)), "A later collapse can consume earlier receipts");
+});
+
+test("receipt-enabled operations replay after historical receipt-free selections", () => {
+  const source = user("source"), first = operation(identify([source]), "first");
+  const messages = [source, assistant([call(first)]), result(first), user("tail", 4)];
+  const second = operation(projectHistory(messages, [first]), "second");
+  messages.push(assistant([call(second, "second")], 5), result(second, "second"));
+  const third: Collapse = { ...operation(projectHistory(messages, [first, second]), "third"), receipt: true };
+  messages.push(assistant([call(third, "third")], 6), result(third, "third"));
+  const rows = projectHistory(messages, [first, second, third]);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].collapseId, third.id);
+  assert.deepEqual(projectHistory(JSON.parse(JSON.stringify(messages)), [first, second, third].map(validateCollapse)), rows);
+});
+
+test("parallel committed operations each retain a receipt in their shared caller", () => {
+  const source = [user("first"), user("second", 2)];
+  const first: Collapse = { ...operation(identify(source).slice(0, 1)), receipt: true };
+  const second: Collapse = { ...operation(identify(source).slice(1)), receipt: true };
+  const messages = [...source, assistant([call(first, "first"), call(second, "second")]), result(first, "first"), result(second, "second")];
+  const rows = projectHistory(messages, [first, second]);
+  const receipt = rows[2].message;
+  assert.equal(receipt.role, "assistant");
+  if (receipt.role === "assistant") assert.deepEqual(receipt.content, [first, second].map(op => ({ type: "text", text: completionReceipt(op.id) })));
+  assert.equal(rows.length, 3);
+});
+
 test("bookkeeping projection version is explicit and validated", () => {
   const op = operation(identify([user("source")]));
   assert.equal(validateCollapse(op).hideBookkeeping, true);
+  assert.equal(validateCollapse({ ...op, receipt: true }).receipt, true);
+  for (const receipt of [false, 1, "true", null]) {
+    assert.throws(() => validateCollapse({ ...op, receipt }), /Invalid collapse journal entry/);
+  }
+  assert.throws(() => validateCollapse({ ...op, receipt: true, hideBookkeeping: undefined }), /Invalid collapse journal entry/);
   assert.equal(validateCollapse({ ...op, hideBookkeeping: undefined }).hideBookkeeping, undefined);
   for (const hideBookkeeping of [false, 1, "true", null]) {
     assert.throws(() => validateCollapse({ ...op, hideBookkeeping }), /Invalid collapse journal entry/);

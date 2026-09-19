@@ -4,7 +4,12 @@ type Assistant = Extract<Message, { role: "assistant" }>;
 type ToolCall = Extract<Assistant["content"][number], { type: "toolCall" }>;
 interface Pair { call: ToolCall; caller: number; result: number }
 
-/** Hide only uniquely paired, successful bookkeeping. Raw identities/provenance
+export function completionReceipt(id: string): string {
+  return `[Collapse completed: ${id}.]`;
+}
+
+/** Hide only uniquely paired, successful bookkeeping, retaining opted-in receipts.
+ * Raw identities/provenance
  * are retained even when an assistant also contains ordinary text or other calls.
  * Failed calls remain visible for recovery; no audit messages are mutated. */
 export function hideBookkeeping(rows: Row[], operations: Collapse[]): Row[] {
@@ -42,6 +47,9 @@ export function hideBookkeeping(rows: Row[], operations: Collapse[]): Row[] {
   }
   // Conflicting results claiming the same operation are not trustworthy bookkeeping.
   const completed = [...mutations.values()].flatMap(pairs => pairs.length === 1 ? pairs : []);
+  // Journal opt-in preserves replay of older selections made without receipts.
+  const receipts = new Map([...mutations].flatMap(([id, pairs]) =>
+    pairs.length === 1 && committed.get(id)?.receipt ? [[pairs[0].call.id, completionReceipt(id)] as const] : []));
   const latestCaller = completed.reduce((latest, pair) => Math.max(latest, pair.caller), -1);
   // A lookup must survive the next request so the model can use its references.
   // It becomes housekeeping only after a later successful mutation consumes it.
@@ -52,8 +60,14 @@ export function hideBookkeeping(rows: Row[], operations: Collapse[]): Row[] {
   return rows.flatMap((row, index) => {
     if (hiddenResults.has(index)) return [];
     if (row.message.role !== "assistant") return [row];
-    const content = row.message.content.filter(block => block.type !== "toolCall" || !hiddenCalls.has(block.id));
-    if (content.length === row.message.content.length) return [row];
+    if (!row.message.content.some(block => block.type === "toolCall" && hiddenCalls.has(block.id))) return [row];
+    // Replace at the caller, not with a user/custom row amid sibling tool results.
+    // The receipt carries no summary or arguments and keeps the original audit key.
+    const content = row.message.content.flatMap((block): Assistant["content"] => {
+      if (block.type !== "toolCall" || !hiddenCalls.has(block.id)) return [block];
+      const text = receipts.get(block.id);
+      return text ? [{ type: "text", text }] : [];
+    });
     return content.length ? [{ ...row, auditMessage: row.auditMessage ?? row.message, message: { ...row.message, content } }] : [];
   });
 }

@@ -119,6 +119,11 @@ function tools(request: Request): string[] {
   return (request.payload.tools as Array<{ name: string }>).map(tool => tool.name);
 }
 function allText(request: Request): string { return JSON.stringify(request.context.messages); }
+function receipts(request: Request): string[] {
+  return request.context.messages.flatMap(message => message.role === "assistant"
+    ? message.content.flatMap(block => block.type === "text" && block.text.startsWith("[Collapse completed:") ? [block.text] : [])
+    : []);
+}
 function operations(manager: SessionManager) {
   return manager.getBranch().flatMap(entry => entry.type === "custom" && entry.customType === OP_TYPE ? [validateCollapse(entry.data)] : []);
 }
@@ -150,6 +155,8 @@ for (const remove of [false, true]) test(`real agent loop: forced ${remove ? "re
       assert.ok(!allText(request).includes("FORCED COLLAPSE MODE"));
       assert.ok(!allText(request).includes('"name":"collapse"'), "Successful collapse call must leave model context");
       assert.ok(!allText(request).includes('"toolName":"collapse"'), "Successful collapse result must leave model context");
+      assert.deepEqual(receipts(request), [`[Collapse completed: ${operations(f.sm)[0].id}.]`],
+        "The next request retains completion evidence without arguments or summary");
       assert.equal(request.context.messages.filter(m => JSON.stringify(m).includes("Custom task finished; preserve its result.")).length, remove ? 0 : 1);
       assert.deepEqual(tools(request).sort(), ["collapse", "normal_action"]);
       return [call("normal_1", "normal_action", {})];
@@ -163,6 +170,7 @@ for (const remove of [false, true]) test(`real agent loop: forced ${remove ? "re
   assert.equal(f.normalCalls(), 1);
   const op = operations(f.sm)[0];
   assert.ok(op);
+  assert.equal(op.receipt, true, "The journal opts new operations into receipt-preserving projection");
   assert.equal((await f.storage.originals(op.id))[0].timestamp, 1, "Archive preserves actual live original");
   assert.ok(f.session.messages.some(message => message.role === "toolResult" && message.toolName === "collapse" && !message.isError));
   assert.ok(f.session.messages.some(message => message.role === "toolResult" && message.toolName === "normal_action" && !message.isError));
@@ -171,9 +179,11 @@ for (const remove of [false, true]) test(`real agent loop: forced ${remove ? "re
   const resumed = await setup(t, { manager: restored, storage: f.storage });
   resumed.script((_index, request) => {
     assert.ok(!allText(request).includes("x".repeat(100)));
-    // Successful bookkeeping stays in the audit only; removals leave no placeholder.
-    assert.equal(allText(request).includes(op.id), !remove);
+    // Receipts survive reopen even for removals; only nonempty summaries get a replacement marker.
+    assert.deepEqual(receipts(request), [`[Collapse completed: ${op.id}.]`]);
     assert.equal(allText(request).includes(`[Collapsed @collapse:${op.id};`), !remove);
+    assert.equal(request.context.messages.filter(m => JSON.stringify(m).includes("Custom task finished; preserve its result.")).length, remove ? 0 : 1);
+    assert.ok(!allText(request).includes('"name":"collapse"'));
     assert.ok(!allText(request).includes('"toolName":"collapse"'));
     return [{ type: "text", text: "Resumed successfully." }];
   });
@@ -182,7 +192,7 @@ for (const remove of [false, true]) test(`real agent loop: forced ${remove ? "re
   assert.equal(resumed.requests.length, 1);
 });
 
-test("real agent loop: forced inspection retains references until mutation, then both successful pairs disappear", async t => {
+test("real agent loop: forced inspection retains references until mutation, then only the mutation receipt remains", async t => {
   const f = await setup(t, { seed(sm) {
     sm.appendMessage({ role: "user", content: "FINISHED_RANGE " + "x".repeat(20_000), timestamp: 1 });
     for (let i = 0; i < 5; i++) sm.appendMessage({ role: "user", content: "DUPLICATE " + "y".repeat(1000), timestamp: i + 2 });
@@ -204,6 +214,8 @@ test("real agent loop: forced inspection retains references until mutation, then
     assert.equal(index, 2);
     assert.ok(!allText(request).includes('"name":"collapse"'));
     assert.ok(!allText(request).includes('"toolName":"collapse"'));
+    assert.deepEqual(receipts(request), [`[Collapse completed: ${operations(f.sm)[0].id}.]`],
+      "Inspection leaves no receipt, while the successful mutation leaves exactly one");
     assert.deepEqual(tools(request).sort(), ["collapse", "normal_action"]);
     return [{ type: "text", text: "Normal work resumes." }];
   });
@@ -231,6 +243,9 @@ test("real agent loop: mixed successful and failed siblings preserve ordinary wo
     if (index === 1) {
       assert.ok(allText(request).includes(explanation));
       assert.ok(!allText(request).includes('"id":"successful"'));
+      assert.deepEqual(receipts(request), [`[Collapse completed: ${operations(f.sm)[0].id}.]`]);
+      assert.equal(request.context.messages.filter(m => JSON.stringify(m).includes("Source work completed.")).length, 1,
+        "The successful sibling receipt does not duplicate the summary");
       assert.ok(allText(request).includes('"id":"failed"'));
       assert.ok(allText(request).includes('"id":"ordinary"'));
       assert.ok(allText(request).includes('"toolCallId":"ordinary"'));
@@ -238,6 +253,8 @@ test("real agent loop: mixed successful and failed siblings preserve ordinary wo
       return [call("archive_mixed", "collapse", { startMatch: "ORDINARY_EXPLANATION", endMatch: "ORDINARY_EXPLANATION", summary: "Ordinary work completed. The absent-marker collapse failed without changes." })];
     }
     assert.equal(index, 2);
+    assert.deepEqual(receipts(request), [`[Collapse completed: ${operations(f.sm)[1].id}.]`],
+      "Archiving the mixed caller consumes its old receipt and leaves the new operation's receipt");
     return [{ type: "text", text: "Finished." }];
   });
   await prompt(f.session, "Continue.");
